@@ -1,0 +1,406 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from statistics import mean
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from tensorflow.keras.optimizers import Adam
+from deap import base, creator, tools, algorithms
+import random
+import warnings
+warnings.filterwarnings('ignore')
+
+creator.create("FitnessMulti", base.Fitness, weights=(-1.0, -1.0))  
+creator.create("Individual", list, fitness=creator.FitnessMulti)
+
+def load_data(filepath):
+    data = pd.read_csv(filepath)
+    data['date'] = pd.to_datetime(data['date'])
+    data.set_index('date', inplace=True)
+    return data
+
+def prepare_data(data, look_back=60):
+    scaler_all = MinMaxScaler(feature_range=(0, 1))
+    scaler_volume = MinMaxScaler(feature_range=(0, 1))
+    
+    scaled_data = scaler_all.fit_transform(data[['close', 'volume']])
+    X_lstm, y_lstm = [], []
+    for i in range(look_back, len(scaled_data)):
+        X_lstm.append(scaled_data[i-look_back:i])
+        y_lstm.append(scaled_data[i, 0])
+    
+    data['volume_scaled'] = scaler_volume.fit_transform(data[['volume']])
+    for i in range(1, look_back+1):
+        data[f'lag_{i}'] = data['close'].shift(i)
+    data.dropna(inplace=True)
+    
+    return {
+        'X_lstm': np.array(X_lstm),
+        'y_lstm': np.array(y_lstm),
+        'X_trad': data[['volume_scaled'] + [f'lag_{i}' for i in range(1, look_back+1)]].values,
+        'y_trad': data['close'].values,
+        'dates': data.index,
+        'scaler_all': scaler_all,
+        'scaler_volume': scaler_volume
+    }
+
+def build_lstm(params, input_shape):
+    model = Sequential()
+    model.add(Input(shape=input_shape))
+    model.add(LSTM(units=params['units'], return_sequences=True))
+    model.add(Dropout(params['dropout']))
+    for _ in range(int(params['hl']) - 1):
+        model.add(LSTM(units=params['units'], return_sequences=True))
+        model.add(Dropout(params['dropout']))
+    model.add(LSTM(units=params['units']))
+    model.add(Dropout(params['dropout']))
+    model.add(Dense(units=1))
+    model.compile(optimizer=Adam(params['lr']), loss='mae')
+    return model
+
+def build_arima(params, y_train):
+    try:
+        p, d, q = int(params['p']), int(params['d']), int(params['q'])
+        if p < 0 or d < 0 or q < 0:
+            return None
+        model = ARIMA(y_train, order=(p, d, q))
+        return model.fit()
+    except:
+        return None
+
+def build_es(params):
+    return {
+        'trend': 'add' if params['trend'] > 0.5 else None,
+        'seasonal': 'add' if params['seasonal'] > 0.5 else None,
+        'seasonal_periods': int(params['seasonal_periods'])
+    }
+
+def build_mlr(params):
+    return Ridge(alpha=params['alpha'])
+
+def create_toolbox(model_type):
+    toolbox = base.Toolbox()
+    
+    if model_type == 'lstm':
+        toolbox.register("attr_units", random.randint, 32, 256)
+        toolbox.register("attr_dropout", random.uniform, 0.1, 0.5)
+        toolbox.register("attr_lr", random.uniform, 1e-4, 1e-2)
+        toolbox.register("attr_batch", random.randint, 16, 128)
+        toolbox.register("attr_epochs", random.randint, 10, 100)
+        toolbox.register("attr_hl", random.randint, 1, 2)
+        toolbox.register("individual", tools.initCycle, creator.Individual,
+                       (toolbox.attr_units, toolbox.attr_dropout, toolbox.attr_lr,
+                        toolbox.attr_batch, toolbox.attr_epochs, toolbox.attr_hl), n=1)
+        
+    elif model_type == 'arima':
+        toolbox.register("attr_p", random.randint, 0, 3)
+        toolbox.register("attr_d", random.randint, 0, 1)
+        toolbox.register("attr_q", random.randint, 0, 3)
+        toolbox.register("individual", tools.initCycle, creator.Individual,
+                       (toolbox.attr_p, toolbox.attr_d, toolbox.attr_q), n=1)
+        
+    elif model_type == 'es':
+        toolbox.register("attr_trend", random.uniform, 0, 1)
+        toolbox.register("attr_seasonal", random.uniform, 0, 1)
+        toolbox.register("attr_seasonal_periods", random.randint, 4, 24)
+        toolbox.register("individual", tools.initCycle, creator.Individual,
+                       (toolbox.attr_trend, toolbox.attr_seasonal, 
+                        toolbox.attr_seasonal_periods), n=1)
+        
+    elif model_type == 'mlr':
+        toolbox.register("attr_alpha", random.uniform, 0, 1)
+        toolbox.register("individual", tools.initRepeat, creator.Individual,
+                       toolbox.attr_alpha, n=1)
+    
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    
+    def cxTwoPointCustom(ind1, ind2):
+        if len(ind1) <= 1:
+            return ind1, ind2
+        return tools.cxTwoPoint(ind1, ind2)
+    
+    toolbox.register("mate", cxTwoPointCustom)
+    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.2)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+    
+    return toolbox
+
+def evaluate_lstm(individual, X_train, y_train, X_test, y_test, scaler):
+    params = {
+        'units': int(individual[0]),
+        'dropout': max(0.1, min(0.5, individual[1])),
+        'lr': max(1e-4, min(1e-2, individual[2])),
+        'batch': int(individual[3]),
+        'epochs': int(individual[4]),
+        'hl': int(individual[5]),
+    }
+    
+    try:
+        model = build_lstm(params, X_train.shape[1:])
+        model.fit(X_train, y_train, 
+                 epochs=params['epochs'], 
+                 batch_size=params['batch'],
+                 verbose=0)
+        pred = model.predict(X_test).flatten()
+        pred = scaler.inverse_transform(np.column_stack([pred, np.zeros_like(pred)]))[:, 0]
+        y_test_actual = scaler.inverse_transform(np.column_stack([y_test, np.zeros_like(y_test)]))[:, 0]
+        rmse = root_mean_squared_error(y_test_actual, pred)
+        mae = mean_absolute_error(y_test_actual, pred)
+        return (rmse, mae)
+    except:
+        return (float('inf'), float('inf'))
+
+def evaluate_arima(individual, y_train, y_test):
+    params = {
+        'p': int(individual[0]),
+        'd': int(individual[1]), 
+        'q': int(individual[2])
+    }
+    
+    try:
+        history = list(y_train)
+        predictions = []
+        
+        for t in range(len(y_test)):
+            if t % 10 == 0: 
+                model = ARIMA(history, order=(params['p'], params['d'], params['q']))
+                model_fit = model.fit()
+            
+            yhat = model_fit.forecast()[0]
+            predictions.append(yhat)
+            history.append(y_test[t])  
+        rmse = root_mean_squared_error(y_test, predictions)
+        mae = mean_absolute_error(y_test, predictions)
+        return (rmse, mae)
+    except Exception as e:
+        print(f"ARIMA error: {str(e)}")
+        return (float('inf'), float('inf'))
+
+def evaluate_es(individual, y_train, y_test):
+    params = build_es({
+        'trend': individual[0],
+        'seasonal': individual[1],
+        'seasonal_periods': int(individual[2])
+    })
+    
+    try:
+        history = list(y_train)
+        predictions = []
+        model = None
+        
+        for t in range(len(y_test)):
+            if t % 10 == 0:  
+                model = ExponentialSmoothing(
+                    history,
+                    trend=params['trend'],
+                    seasonal=params['seasonal'],
+                    seasonal_periods=params['seasonal_periods']
+                ).fit()
+            
+            yhat = model.forecast(1)[0]
+            predictions.append(yhat)
+            history.append(y_test[t])  
+        rmse = root_mean_squared_error(y_test, predictions)
+        mae = mean_absolute_error(y_test, predictions)
+        return (rmse, mae)
+    except Exception as e:
+        print(f"ETS error: {str(e)}")
+        return (float('inf'), float('inf'))
+
+def evaluate_mlr(individual, X_train, y_train, X_test, y_test):
+    params = {'alpha': individual[0]}
+    
+    try:
+        model = build_mlr(params).fit(X_train, y_train)
+        pred = model.predict(X_test)
+        rmse = root_mean_squared_error(y_test, pred)
+        mae = mean_absolute_error(y_test, pred)
+        return (rmse, mae)
+    except:
+        return (float('inf'), float('inf'))
+
+def decode_params(individual, model_type):
+    if model_type == 'lstm':
+        return {
+            'units': int(individual[0]),
+            'dropout': max(0.1, min(0.5, individual[1])),
+            'lr': max(1e-4, min(1e-2, individual[2])),
+            'batch': int(individual[3]),
+            'epochs': int(individual[4]),
+            'hl': int(individual[5])
+        }
+    elif model_type == 'arima':
+        return {
+            'p': int(individual[0]),
+            'd': int(individual[1]),
+            'q': int(individual[2])
+        }
+    elif model_type == 'es':
+        return {
+            'trend': individual[0],
+            'seasonal': individual[1],
+            'seasonal_periods': int(individual[2])
+        }
+    elif model_type == 'mlr':
+        return {'alpha': individual[0]}
+
+def optimize_and_compare(data_path):
+    data = load_data(data_path)
+    prepared = prepare_data(data)
+    
+    split = int(0.8 * len(prepared['X_lstm']))
+    
+    X_train_lstm, X_test_lstm = prepared['X_lstm'][:split], prepared['X_lstm'][split:]
+    y_train_lstm, y_test_lstm = prepared['y_lstm'][:split], prepared['y_lstm'][split:]
+    
+    X_train_trad, X_test_trad = prepared['X_trad'][:split], prepared['X_trad'][split:]
+    y_train_trad, y_test_trad = prepared['y_trad'][:split], prepared['y_trad'][split:]
+    test_dates = prepared['dates'][split:]
+    
+    results = {
+        'Model': [],
+        'Best Params': [],
+        'RMSE': [],
+        'MAE': []
+    }
+    
+    all_predictions = {}
+    colors = {'lstm': 'red', 'arima': 'blue', 'es': 'green', 'mlr': 'purple'}
+    
+    for model_type in ['lstm', 'arima', 'es', 'mlr']:
+        print(f"\nOptimizing {model_type.upper()}...")
+        
+        toolbox = create_toolbox(model_type)
+        
+        if model_type == 'lstm':
+            toolbox.register("evaluate", evaluate_lstm,
+                           X_train=X_train_lstm, y_train=y_train_lstm,
+                           X_test=X_test_lstm, y_test=y_test_lstm,
+                           scaler=prepared['scaler_all'])
+        elif model_type == 'arima':
+            toolbox.register("evaluate", evaluate_arima,
+                           y_train=y_train_trad,
+                           y_test=y_test_trad)
+        elif model_type == 'es':
+            toolbox.register("evaluate", evaluate_es,
+                           y_train=y_train_trad,
+                           y_test=y_test_trad)
+        elif model_type == 'mlr':
+            toolbox.register("evaluate", evaluate_mlr,
+                           X_train=X_train_trad, y_train=y_train_trad,
+                           X_test=X_test_trad, y_test=y_test_trad)
+        
+        pop = toolbox.population(n=20)
+        hof = tools.HallOfFame(1)
+        stats = tools.Statistics(lambda ind: ind.fitness.values)
+        stats.register("avg", np.mean, axis=0)
+        stats.register("min", np.min, axis=0)
+        
+        pop, log = algorithms.eaSimple(
+            pop, toolbox, cxpb=0.5, mutpb=0.2,
+            ngen=5, stats=stats, halloffame=hof, verbose=True
+        )
+        
+        best_ind = hof[0]
+        best_params = decode_params(best_ind, model_type)
+        rmse, mae = best_ind.fitness.values
+        
+        results['Model'].append(model_type.upper())
+        results['Best Params'].append(str(best_params))
+        results['RMSE'].append(rmse)
+        results['MAE'].append(mae)
+        
+        if model_type == 'lstm':
+            model = build_lstm(best_params, X_train_lstm.shape[1:])
+            model.fit(X_train_lstm, y_train_lstm, 
+                     epochs=int(best_params['epochs']), 
+                     batch_size=int(best_params['batch']),
+                     verbose=0)
+            pred = model.predict(X_test_lstm).flatten()
+            pred = prepared['scaler_all'].inverse_transform(np.column_stack([pred, np.zeros_like(pred)]))[:, 0]
+            y_test_actual = prepared['scaler_all'].inverse_transform(np.column_stack([y_test_lstm, np.zeros_like(y_test_lstm)]))[:, 0]
+        
+        elif model_type == 'arima':
+            history = list(y_train_trad)
+            pred = []
+            model_fit = None
+            
+            for t in range(len(y_test_trad)):
+                model = ARIMA(history, order=(best_params['p'], best_params['d'], best_params['q']))
+                model_fit = model.fit()
+                
+                yhat = model_fit.forecast()[0]
+                pred.append(yhat)
+                history.append(y_test_trad[t])
+            y_test_actual = y_test_trad
+        
+        elif model_type == 'es':
+            es_params = build_es(best_params)
+            history = list(y_train_trad)
+            pred = []
+            model = None
+            
+            for t in range(len(y_test_trad)):
+                model = ExponentialSmoothing(
+                    history,
+                    trend=es_params['trend'],
+                    seasonal=es_params['seasonal'],
+                    seasonal_periods=es_params['seasonal_periods']
+                ).fit()
+                
+                yhat = model.forecast(1)[0]
+                pred.append(yhat)
+                history.append(y_test_trad[t])
+            y_test_actual = y_test_trad
+        
+        elif model_type == 'mlr':
+            model = build_mlr(best_params).fit(X_train_trad, y_train_trad)
+            pred = model.predict(X_test_trad)
+            y_test_actual = y_test_trad
+        
+        all_predictions[model_type] = {
+            'pred': pred[:len(test_dates)],
+            'rmse': rmse,
+            'mae': mae,
+            'color': colors[model_type]
+        }
+    
+    plt.figure(figsize=(16, 8))
+    plt.plot(test_dates, y_test_actual, label='Actual', color='black', linewidth=2.5)
+
+    styles = {
+        'lstm': {'color': 'red', 'linestyle': '-', 'linewidth': 1.5},
+        'arima': {'color': 'blue', 'linestyle': '-', 'linewidth': 1.5},
+        'es': {'color': 'green', 'linestyle': '-', 'linewidth': 1.5},
+        'mlr': {'color': 'purple', 'linestyle': '-', 'linewidth': 1.5}
+    }
+
+    for model_type, data in all_predictions.items():
+        plt.plot(test_dates, data['pred'], 
+                label=f'{model_type.upper()}',
+                **styles[model_type])
+
+    plt.title('Model Comparison - Forecasting Results', fontsize=14, pad=20)
+    plt.xlabel('Date', fontsize=12)
+    plt.ylabel('Price', fontsize=12)
+    plt.legend(fontsize=10, framealpha=0.9)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.gca().xaxis.set_major_locator(plt.MaxNLocator(15))
+    plt.xticks(rotation=45)
+    plt.show()
+    
+    results_df = pd.DataFrame(results)
+    print("\nFinal Comparison:")
+    print(results_df.to_string(index=False))
+    
+    return results_df
+
+if __name__ == "__main__":
+    data_path = 'path\to\csv\file'
+    results = optimize_and_compare(data_path)
